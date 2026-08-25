@@ -1,9 +1,11 @@
 import os
-from flask import Flask, request, jsonify
-import requests, json, re, datetime
+from flask import Flask, request, jsonify, url_for
+import requests, json, re, datetime, uuid
 import urllib.parse
+from gtts import gTTS
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static')
+os.makedirs('static', exist_ok=True)
 
 # Use Environment Variables for Cloud Deployment!
 # You will set these in the Render.com Dashboard
@@ -167,9 +169,22 @@ def ask():
     screen = ai.get("screen","none")
     if screen not in ("none","dog_running","clear", "face_idle", "face_happy", "face_sad", "face_angry"): screen="none"
     
+    
+    # Generate TTS Audio
+    reply_text = str(ai.get("reply","Done."))
+    audio_url = ""
+    try:
+        tts = gTTS(text=reply_text, lang='en', slow=False)
+        filename = f"tts_{uuid.uuid4().hex[:8]}.mp3"
+        filepath = os.path.join('static', filename)
+        tts.save(filepath)
+        audio_url = request.host_url + f"static/{filename}"
+    except Exception as e:
+        print("TTS Error:", e)
+
     out = {
         "success": True,
-        "reply": str(ai.get("reply","Done.")),
+        "reply": reply_text,
         "action": action,
         "r": clamp(ai.get("r",0),0,255,0),
         "g": clamp(ai.get("g",0),0,255,0),
@@ -177,7 +192,8 @@ def ask():
         "mode": mode,
         "speed_ms": clamp(ai.get("speed_ms",120),30,2000,120),
         "brightness": clamp(ai.get("brightness",255),0,255,255),
-        "screen": screen
+        "screen": screen,
+        "audio_url": audio_url
     }
     print("MIO:", text, "=>", out)
     return jsonify(out)

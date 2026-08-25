@@ -2,34 +2,73 @@
 // Libraries Required: 
 // 1. Adafruit GFX, Adafruit ST7735, Adafruit NeoPixel
 // 2. ArduinoJson
-// 3. esp32_https_server (by Frank Hessel)
+// 3. EspUsbHost (Install this from the Arduino Library Manager!)
 
-#include <WiFi.h>
-#include <ESPmDNS.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
-#include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
+#include <SPI.h>
 #include <Adafruit_NeoPixel.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <ESPmDNS.h>
+#include <WebServer.h>
+#include <EspUsbHost.h>
 #include <math.h>
 
-// HTTPS Server Includes
-#include <HTTPSServer.hpp>
-#include <SSLCert.hpp>
-#include <HTTPRequest.hpp>
-#include <HTTPResponse.hpp>
+#include <AudioFileSourceHTTPStream.h>
+#include <AudioGeneratorMP3.h>
+#include <AudioOutput.h>
 
-using namespace httpsserver;
+class AudioOutputPWM : public AudioOutput {
+  private:
+    int pin;
+    uint32_t sampleRate;
+    unsigned long sampleIntervalMicros;
+    unsigned long lastSampleMicros;
+  public:
+    AudioOutputPWM(int gpioPin) {
+      pin = gpioPin;
+      lastSampleMicros = 0;
+    }
+    virtual ~AudioOutputPWM() {}
+    virtual bool begin() override {
+      pinMode(pin, OUTPUT);
+      analogWriteFrequency(pin, 120000); 
+      analogWriteResolution(pin, 8); 
+      return true;
+    }
+    virtual bool ConsumeSample(int16_t sample[2]) override {
+      while (micros() - lastSampleMicros < sampleIntervalMicros) {
+        yield();
+      }
+      lastSampleMicros += sampleIntervalMicros;
+      int32_t val = (sample[0] + 32768) >> 8;
+      if (val < 0) val = 0;
+      if (val > 255) val = 255;
+      analogWrite(pin, (uint8_t)val);
+      return true;
+    }
+    virtual bool SetRate(int hz) override {
+      sampleRate = hz;
+      sampleIntervalMicros = 1000000 / hz;
+      return true;
+    }
+    virtual bool SetBitsPerSample(int bits) override { return true; }
+    virtual bool SetChannels(int channels) override { return true; }
+    virtual bool stop() override { return true; }
+};
+
+EspUsbHost usb;
+EspUsbHostMscFS usbMassStorage;
 
 // --- CONFIGURATION ---
 const char* homeSSID = "Appsphero Technologies";
 const char* homePassword = "checking1234";
 
 // Replace with your actual Render API endpoint URL (e.g., https://your-app.onrender.com/ask)
-// For now, if you run the Python script locally, it will be http://<your-pc-ip>:5000/ask
-const char* aiServerUrl = "http://192.168.0.x:5000/ask";
+const char* aiServerUrl = "https://mio-brain.onrender.com/ask";
 // Model and API key are now securely managed on the Cloud Brain!
 
 #define TFT_CLK 14
@@ -45,15 +84,19 @@ const char* aiServerUrl = "http://192.168.0.x:5000/ask";
 Adafruit_ST7735 tft(&SPI, TFT_CS, TFT_DC, TFT_RST);
 Adafruit_NeoPixel rgb(RGB_COUNT, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
-SSLCert * cert;
-HTTPSServer * secureServer;
+WebServer server(80);
 
 enum State { IDLE, LISTENING, THINKING, SPEAKING, ERROR_STATE };
 volatile State state = IDLE;
 volatile bool aiBusy = false, resultReady = false, aiSuccess = false;
 
 String pendingCommand = "", aiReply = "", aiAction = "none", aiMode = "solid", aiScreen = "none";
-int aiR = 0, aiG = 0, aiB = 0, aiSpeed = 120, aiBrightness = 255;
+int aiR = 0, aiG = 0, aiB = 0;
+int aiSpeed = 120;
+int aiBrightness = 255;
+String aiAudioUrl = "";
+
+unsigned long lastPing = 0;
 int lightR = 0, lightG = 0, lightB = 0, lightBrightness = 255;
 String lightMode = "solid";
 int lightSpeed = 120;
@@ -71,9 +114,6 @@ int frame = 0;
 
 State prevState = (State)-1;
 String prevScreenMode = "";
-
-int prevRad = 0;
-int prevH[7] = {0};
 
 int prevRad = 0;
 int prevH[7] = {0};
@@ -255,7 +295,8 @@ void updateLight() {
 // --- TOOLS ---
 // --- AI TASK ---
 String callCloudBrain(String text) {
-  WiFiClient client;
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
   
   http.begin(client, aiServerUrl);
@@ -304,6 +345,19 @@ void aiTask(void* p) {
         aiSpeed = aiDoc["speed_ms"] | 120;
         aiBrightness = aiDoc["brightness"] | 255;
         aiReply = aiDoc["reply"].as<String>();
+        aiAudioUrl = aiDoc["audio_url"] | "";
+        
+        // --- LOG TO USB FLASH DRIVE ---
+        File logFile = usbMassStorage.open("/MIO_LOG.TXT", FILE_APPEND);
+        if (logFile) {
+          logFile.println("USER: " + text);
+          logFile.println("MIO: " + aiReply);
+          logFile.println("----------------");
+          logFile.close();
+          Serial.println("Saved chat to USB Flash Drive!");
+        } else {
+          Serial.println("Failed to open USB file (Drive not inserted or not FAT32).");
+        }
       } else {
         aiReply = aiDoc["reply"] | "Unknown cloud error.";
       }
@@ -325,6 +379,33 @@ void aiTask(void* p) {
   
   aiBusy = false;
   resultReady = true;
+
+  // --- PLAY AUDIO IF AVAILABLE ---
+  if (aiAudioUrl != "") {
+    state = SPEAKING; // Use SPEAKING state to block new commands or show UI
+    Serial.println("Playing Audio: " + aiAudioUrl);
+    
+    AudioFileSourceHTTPStream *file = new AudioFileSourceHTTPStream(aiAudioUrl.c_str());
+    AudioGeneratorMP3 *mp3 = new AudioGeneratorMP3();
+    AudioOutputPWM *out = new AudioOutputPWM(17); // GPIO 17 connected to D8550 Base
+    
+    if (mp3->begin(file, out)) {
+      while(mp3->isRunning()) {
+        if (!mp3->loop()) {
+          mp3->stop();
+        }
+        updateLight(); // Keep the LEDs animating while speaking!
+      }
+    } else {
+      Serial.println("MP3 Decode failed.");
+    }
+    
+    delete mp3;
+    delete file;
+    delete out;
+    state = IDLE;
+  }
+  
   vTaskDelete(NULL);
 }
 
@@ -334,40 +415,30 @@ void startJob(String text) {
   xTaskCreatePinnedToCore(aiTask, "EMOAI", 12000, NULL, 1, NULL, 0); // Need more stack for JSON
 }
 
-// --- HTTPS SERVER HANDLERS ---
-void handleCommand(HTTPRequest * req, HTTPResponse * res) {
+// --- HTTP SERVER HANDLERS ---
+void handleCommand() {
   if (aiBusy) {
-    res->setStatusCode(429);
-    res->setHeader("Content-Type", "application/json");
-    res->println("{\"started\":false,\"error\":\"busy\"}");
+    server.send(429, "application/json", "{\"started\":false,\"error\":\"busy\"}");
     return;
   }
   
-  auto params = req->getParams();
-  std::string textParam;
-  if (!params->getQueryParameter("text", textParam)) {
-    res->setStatusCode(400);
-    res->setHeader("Content-Type", "application/json");
-    res->println("{\"started\":false}");
+  if (!server.hasArg("text")) {
+    server.send(400, "application/json", "{\"started\":false}");
     return;
   }
   
-  String text = String(textParam.c_str());
+  String text = server.arg("text");
   text.trim();
   if (!text.length()) {
-    res->setStatusCode(400);
-    res->setHeader("Content-Type", "application/json");
-    res->println("{\"started\":false}");
+    server.send(400, "application/json", "{\"started\":false}");
     return;
   }
   state = LISTENING;
   startJob(text);
-  res->setStatusCode(200);
-  res->setHeader("Content-Type", "application/json");
-  res->println("{\"started\":true}");
+  server.send(200, "application/json", "{\"started\":true}");
 }
 
-void handleStatus(HTTPRequest * req, HTTPResponse * res) {
+void handleStatus() {
   DynamicJsonDocument doc(512);
   doc["busy"] = aiBusy;
   doc["version"] = resultVersion;
@@ -379,12 +450,10 @@ void handleStatus(HTTPRequest * req, HTTPResponse * res) {
   
   String out;
   serializeJson(doc, out);
-  res->setStatusCode(200);
-  res->setHeader("Content-Type", "application/json");
-  res->println(out.c_str());
+  server.send(200, "application/json", out);
 }
 
-void handleRoot(HTTPRequest * req, HTTPResponse * res) {
+void handleRoot() {
   const char* page = R"HTML(
 <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>EMO (SSL)</title><style>
@@ -400,7 +469,7 @@ main{position:relative;max-width:700px;margin:auto;padding:24px 16px 45px}.title
 <button class="btn ask" id="ask">ASK EMO</button>
 <div class="reply" id="reply"><div class="label">EMO</div>Awaiting command.</div>
 <div class="device"><div id="lamp" class="lamp"></div><div><b>RGB LIGHT</b><div id="rgb">RGB(0,0,0)</div><div id="mode">solid</div></div></div>
-<div class="hint">Microphone requires HTTPS connection. Accept the self-signed certificate warning to proceed.</div>
+<div class="hint">Microphone requires you to set the <b>#unsafely-treat-insecure-origin-as-secure</b> flag in Chrome!</div>
 </div></main>
 <script>
 const $=id=>document.getElementById(id), cmd=$('cmd'), ask=$('ask'), mic=$('mic'), orb=$('orb'), status=$('status'), reply=$('reply');
@@ -456,17 +525,7 @@ mic.onclick=()=>{if(recognition)recognition.stop();else voice()};
 </script></body></html>
 )HTML"; // "
 
-  res->setStatusCode(200);
-  res->setHeader("Content-Type", "text/html");
-  
-  // Send HTML in chunks to prevent TLS buffer overflow and ESP32 crashes
-  int len = strlen(page);
-  int offset = 0;
-  while (offset < len) {
-    int chunkSize = min(1024, len - offset);
-    res->write((uint8_t*)(page + offset), chunkSize);
-    offset += chunkSize;
-  }
+  server.send(200, "text/html", page);
 }
 
 void setup() {
@@ -486,8 +545,12 @@ void setup() {
   rgb.begin(); rgb.show(); setLight(0, 0, 0, "off", 120, 0);
 
   tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setCursor(5, 5);
-  tft.println("Connecting WiFi...");
-
+  tft.println("Init...");
+  
+  // Start USB Host in the background
+  // usb.begin();
+  
+  // Connect WiFi...
   WiFi.mode(WIFI_AP_STA); 
   WiFi.setHostname("mio"); 
   WiFi.softAP("MIO_NETWORK", "checking1234");
@@ -515,31 +578,21 @@ void setup() {
     tft.println("WiFi Failed!"); 
     tft.print("AP IP: "); tft.println(WiFi.softAPIP());
   }
-  if (MDNS.begin("mio")) Serial.println("MDNS started: https://mio.local");
+  if (MDNS.begin("mio")) Serial.println("MDNS started: http://mio.local");
 
-  // Generate SSL Certificate
-  Serial.println("Generating SSL Cert (takes a moment)...");
-  tft.println("Gen SSL Cert...");
-  cert = new SSLCert();
-  createSelfSignedCert(*cert, KEYSIZE_2048, "CN=mio.local,O=MIO,C=US");
-  secureServer = new HTTPSServer(cert);
+  // Start HTTP Server
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/command", HTTP_GET, handleCommand);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.begin();
 
-  ResourceNode * nodeRoot = new ResourceNode("/", "GET", &handleRoot);
-  ResourceNode * nodeCmd = new ResourceNode("/command", "GET", &handleCommand);
-  ResourceNode * nodeStatus = new ResourceNode("/status", "GET", &handleStatus);
-  
-  secureServer->registerNode(nodeRoot);
-  secureServer->registerNode(nodeCmd);
-  secureServer->registerNode(nodeStatus);
-  secureServer->start();
-
-  Serial.println("HTTPS Server started.");
-  tft.println("HTTPS Started!");
+  Serial.println("HTTP Server started.");
+  tft.println("HTTP Started!");
   delay(2000);
 }
 
 void loop() {
-  secureServer->loop();
+  server.handleClient();
   updateLight();
 
   if (resultReady) {
