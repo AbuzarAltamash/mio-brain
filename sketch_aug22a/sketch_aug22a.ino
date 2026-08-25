@@ -1,4 +1,4 @@
-// EMO ESP32-S3 - Direct AI Connection & HTTPS Server
+// MIO ESP32-S3 - Cloud AI Connection & HTTPS Server
 // Libraries Required: 
 // 1. Adafruit GFX, Adafruit ST7735, Adafruit NeoPixel
 // 2. ArduinoJson
@@ -27,10 +27,10 @@ using namespace httpsserver;
 const char* homeSSID = "Appsphero Technologies";
 const char* homePassword = "checking1234";
 
-// Replace with your actual API endpoint URL (e.g., your Ngrok URL + /api/chat)
-const char* aiServerUrl = "https://ollama.com/api/chat";
-const char* aiModel = "gemma4:cloud";
-const char* apiKey = "8c29b30c4415491d9fda6a4b14e989df.fP5vKN-5zKCKDdoM3qXkr3kM"; // Added to Authorization header
+// Replace with your actual Render API endpoint URL (e.g., https://your-app.onrender.com/ask)
+// For now, if you run the Python script locally, it will be http://<your-pc-ip>:5000/ask
+const char* aiServerUrl = "http://192.168.0.x:5000/ask";
+// Model and API key are now securely managed on the Cloud Brain!
 
 #define TFT_CLK 14
 #define TFT_MOSI 21
@@ -75,50 +75,8 @@ String prevScreenMode = "";
 int prevRad = 0;
 int prevH[7] = {0};
 
-// Conversational Memory (Stores last 2 exchanges = 4 messages) to save input tokens
-String chatHistory[4];
-int chatCount = 0;
-
-const char* SYSTEM_PROMPT = R"PROMPT(
-You are EMO, a warm, extremely friendly, and enthusiastic AI companion controlling an ESP32. Keep answers very short and conversational but no emojis or emoticons allowed. Always sound happy to help!
-Understand natural language; never require exact phrases.
-You can use tools to fetch real-world information.
-
-Return ONLY one valid JSON object with exactly these keys:
-{
- "reply":"short natural response",
- "action":"none or set_light",
- "r":0,"g":0,"b":0,
- "mode":"solid or blink or breathe or off",
- "speed_ms":120,
- "brightness":255,
- "screen":"none or dog_running or clear or face_idle or face_happy or face_sad or face_angry",
- "tool":"none or weather or joke",
- "tool_args":""
-}
-
-LIGHT INTERPRETATION:
-- Any request about changing, turning, dimming, brightening, blinking, pulsing, breathing, fading, flashing, or smoothly turning an RGB light is action="set_light".
-- Convert requested/implied colors to RGB creatively.
-- "blink fast": blink with speed_ms around 80-180.
-- "blink slow": around 500-1200.
-- "dim": lower brightness appropriately, usually 20-100, while preserving requested/current implied color if specified.
-- "bright": brightness 200-255.
-- "smooth", "fade", "pulse", "breathe", "smooth on and off": mode="breathe".
-- "turn off": action="set_light", mode="off", RGB 0,0,0, brightness 0.
-- "turn on" without a color should use a sensible white unless context provides a color.
-
-SCREEN INTERPRETATION:
-- To show a dog running, set screen="dog_running". To clear the screen, set screen="clear".
-- To show expressive robot eyes, set screen to one of: "face_idle", "face_happy", "face_sad", "face_angry". Choose the emotion that fits your reply.
-- A light command and a screen request may occur together.
-
-TOOL USAGE:
-- If you need to know the current weather, set "tool":"weather" and "tool_args":"City Name". (If no city is given, leave it empty).
-- If you are asked to tell a joke, set "tool":"joke".
-
-Keep reply short. No markdown. No extra text outside JSON.
-)PROMPT";
+int prevRad = 0;
+int prevH[7] = {0};
 
 // --- DRAWING FUNCTIONS ---
 void header(const char* title, uint16_t c = ST77XX_CYAN) {
@@ -295,159 +253,50 @@ void updateLight() {
 }
 
 // --- TOOLS ---
-String fetchJoke() {
-  HTTPClient http;
-  http.begin("https://official-joke-api.appspot.com/random_joke");
-  int code = http.GET();
-  String res = "Joke API failed.";
-  if (code == 200) {
-    DynamicJsonDocument doc(512);
-    deserializeJson(doc, http.getString());
-    res = doc["setup"].as<String>() + " ... " + doc["punchline"].as<String>();
-  }
-  http.end();
-  return res;
-}
-String fetchWeather(String city) {
-  if (city == "") city = "New York"; // Default
-  HTTPClient http;
-  http.begin("https://geocoding-api.open-meteo.com/v1/search?name=" + city + "&count=1");
-  int code = http.GET();
-  if (code != 200) { http.end(); return "Could not find weather data."; }
-  DynamicJsonDocument doc(1024);
-  deserializeJson(doc, http.getString());
-  http.end();
-  
-  if (doc["results"].isNull()) return "City not found.";
-  float lat = doc["results"][0]["latitude"];
-  float lon = doc["results"][0]["longitude"];
-  
-  http.begin("https://api.open-meteo.com/v1/forecast?latitude=" + String(lat) + "&longitude=" + String(lon) + "&current_weather=true");
-  code = http.GET();
-  String res = "Weather API failed.";
-  if (code == 200) {
-    DynamicJsonDocument wdoc(1024);
-    deserializeJson(wdoc, http.getString());
-    float temp = wdoc["current_weather"]["temperature"];
-    res = "Weather in " + city + ": " + String(temp) + "C.";
-  }
-  http.end();
-  return res;
-}
-
 // --- AI TASK ---
-String callOllama(String text, String sysPrompt) {
-  WiFiClientSecure client;
-  client.setInsecure();
+String callCloudBrain(String text) {
+  WiFiClient client;
   HTTPClient http;
   
   http.begin(client, aiServerUrl);
-  http.setTimeout(30000); // Wait up to 30 seconds for AI response
+  http.setTimeout(45000); // Wait up to 45 seconds for Cloud AI response
   http.addHeader("Content-Type", "application/json");
-  if (String(apiKey).length() > 0) {
-    http.addHeader("Authorization", "Bearer " + String(apiKey));
-  }
   
-  // Build JSON body
-  DynamicJsonDocument reqDoc(8192);
-  reqDoc["model"] = aiModel;
-  reqDoc["format"] = "json";
-  reqDoc["stream"] = false;
-  
-  // Options
-  JsonObject options = reqDoc.createNestedObject("options");
-  options["temperature"] = 0.2;
-  
-  JsonArray msgs = reqDoc.createNestedArray("messages");
-  
-  JsonObject sysMsg = msgs.createNestedObject();
-  sysMsg["role"] = "system";
-  sysMsg["content"] = sysPrompt;
-  
-  for (int i=0; i<chatCount; i+=2) {
-    JsonObject um = msgs.createNestedObject();
-    um["role"] = "user"; um["content"] = chatHistory[i];
-    if (i+1 < chatCount) {
-      JsonObject am = msgs.createNestedObject();
-      am["role"] = "assistant"; am["content"] = chatHistory[i+1];
-    }
-  }
-  
-  JsonObject curMsg = msgs.createNestedObject();
-  curMsg["role"] = "user";
-  curMsg["content"] = text;
-  
+  DynamicJsonDocument reqDoc(512);
+  reqDoc["text"] = text;
   String body;
   serializeJson(reqDoc, body);
   
   int code = http.POST(body);
   String resStr = "";
   if (code == 200) {
-    String payload = http.getString();
-    Serial.println("API Payload:"); Serial.println(payload);
-    
-    DynamicJsonDocument resDoc(8192);
-    DeserializationError err = deserializeJson(resDoc, payload);
-    if (!err) {
-      resStr = resDoc["message"]["content"].as<String>();
-    } else {
-      resStr = "{\"reply\":\"API JSON Parse Error: " + String(err.c_str()) + "\",\"action\":\"face_sad\"}";
-    }
+    resStr = http.getString();
+    Serial.println("Cloud Payload:"); Serial.println(resStr);
   } else {
     String errBody = http.getString();
-    Serial.print("Ollama Error: "); Serial.println(code);
+    Serial.print("Cloud Error: "); Serial.println(code);
     Serial.println(errBody);
     
-    // Construct a fallback JSON so the app doesn't crash, and the user sees the error
     String safeError = errBody;
     safeError.replace("\"", "'");
     safeError.replace("\n", " ");
-    resStr = "{\"reply\":\"HTTP Error " + String(code) + ": " + safeError + "\",\"action\":\"face_sad\"}";
+    resStr = "{\"success\":false,\"reply\":\"HTTP Error " + String(code) + ": " + safeError + "\",\"action\":\"face_sad\"}";
   }
   http.end();
   return resStr;
 }
 
-String cleanJson(String raw) {
-  int start = raw.indexOf('{');
-  int end = raw.lastIndexOf('}');
-  if (start != -1 && end != -1) return raw.substring(start, end + 1);
-  return raw;
-}
-
 void aiTask(void* p) {
   String text = pendingCommand;
-  
-  String rawAi = callOllama(text, SYSTEM_PROMPT);
+  String rawAi = callCloudBrain(text);
   
   bool success = false;
   DynamicJsonDocument aiDoc(2048);
   if (rawAi != "") {
-    String clean = cleanJson(rawAi);
-    DeserializationError err = deserializeJson(aiDoc, clean);
+    DeserializationError err = deserializeJson(aiDoc, rawAi);
     if (!err) {
-      String tool = aiDoc["tool"] | "none";
-      if (tool != "none") {
-        String args = aiDoc["tool_args"] | "";
-        String toolRes = "";
-        if (tool == "weather") toolRes = fetchWeather(args);
-        else if (tool == "joke") toolRes = fetchJoke();
-        else toolRes = "Unknown tool.";
-        
-        // Loop back
-        chatHistory[chatCount++] = text;
-        chatHistory[chatCount++] = clean;
-        if (chatCount >= 4) { // Shift history
-          for (int i=0; i<2; i++) chatHistory[i] = chatHistory[i+2];
-          chatCount -= 2;
-        }
-        
-        rawAi = callOllama("TOOL RESULT: " + toolRes + ". Now provide final answer with tool='none'.", SYSTEM_PROMPT);
-        clean = cleanJson(rawAi);
-        err = deserializeJson(aiDoc, clean);
-      }
-      if (!err) {
-        success = true;
+      success = aiDoc["success"] | false;
+      if (success) {
         aiAction = aiDoc["action"] | "none";
         aiMode = aiDoc["mode"] | "solid";
         aiScreen = aiDoc["screen"] | "none";
@@ -455,28 +304,19 @@ void aiTask(void* p) {
         aiSpeed = aiDoc["speed_ms"] | 120;
         aiBrightness = aiDoc["brightness"] | 255;
         aiReply = aiDoc["reply"].as<String>();
-        
-        chatHistory[chatCount++] = text;
-        chatHistory[chatCount++] = clean;
-        if (chatCount >= 4) { // Shift history
-          for (int i=0; i<2; i++) chatHistory[i] = chatHistory[i+2];
-          chatCount -= 2;
-        }
       } else {
-        Serial.print("Model JSON Parse Error: "); Serial.println(err.c_str());
-        aiSuccess = false;
-        aiReply = "Model Parse Error: " + String(err.c_str());
+        aiReply = aiDoc["reply"] | "Unknown cloud error.";
       }
     } else {
-      Serial.print("Model JSON Parse Error: "); Serial.println(err.c_str());
+      Serial.print("Cloud JSON Parse Error: "); Serial.println(err.c_str());
       aiSuccess = false;
-      aiReply = "Model Parse Error: " + String(err.c_str());
+      aiReply = "Cloud Parse Error: " + String(err.c_str());
     }
   }
   
   if (!success && aiReply == "") {
     aiSuccess = false;
-    aiReply = "AI connection or parsing failed.";
+    aiReply = "Cloud connection or parsing failed.";
   } else if (!success) {
     aiSuccess = false;
   } else {
@@ -649,8 +489,8 @@ void setup() {
   tft.println("Connecting WiFi...");
 
   WiFi.mode(WIFI_AP_STA); 
-  WiFi.setHostname("emo"); 
-  WiFi.softAP("EMO_NETWORK", "checking1234");
+  WiFi.setHostname("mio"); 
+  WiFi.softAP("MIO_NETWORK", "checking1234");
   
   // Try primary WiFi
   WiFi.begin(homeSSID, homePassword);
@@ -675,13 +515,13 @@ void setup() {
     tft.println("WiFi Failed!"); 
     tft.print("AP IP: "); tft.println(WiFi.softAPIP());
   }
-  if (MDNS.begin("emo")) Serial.println("MDNS started: https://emo.local");
+  if (MDNS.begin("mio")) Serial.println("MDNS started: https://mio.local");
 
   // Generate SSL Certificate
   Serial.println("Generating SSL Cert (takes a moment)...");
   tft.println("Gen SSL Cert...");
   cert = new SSLCert();
-  createSelfSignedCert(*cert, KEYSIZE_2048, "CN=emo.local,O=EMO,C=US");
+  createSelfSignedCert(*cert, KEYSIZE_2048, "CN=mio.local,O=MIO,C=US");
   secureServer = new HTTPSServer(cert);
 
   ResourceNode * nodeRoot = new ResourceNode("/", "GET", &handleRoot);
