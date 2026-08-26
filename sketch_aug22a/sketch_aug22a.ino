@@ -18,36 +18,47 @@
 #include <math.h>
 
 #include <AudioFileSourceHTTPStream.h>
+#include <AudioFileSourcePROGMEM.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioOutput.h>
 
 class AudioOutputPWM : public AudioOutput {
   private:
-    int pin;
+    int audioPin;
     uint32_t sampleRate;
     unsigned long sampleIntervalMicros;
     unsigned long lastSampleMicros;
+    int sampleCount;
   public:
     AudioOutputPWM(int gpioPin) {
-      pin = gpioPin;
+      audioPin = gpioPin;
+      sampleRate = 16000;
+      sampleIntervalMicros = 1000000 / sampleRate;
       lastSampleMicros = 0;
+      sampleCount = 0;
     }
-    virtual ~AudioOutputPWM() {}
     virtual bool begin() override {
-      pinMode(pin, OUTPUT);
-      analogWriteFrequency(pin, 120000); 
-      analogWriteResolution(pin, 8); 
+      ledcAttach(audioPin, 120000, 8); // ESP32 Core 3.0: 120kHz, 8-bit resolution
       return true;
     }
     virtual bool ConsumeSample(int16_t sample[2]) override {
-      while (micros() - lastSampleMicros < sampleIntervalMicros) {
-        yield();
+      // Feed the Watchdog by yielding 1ms every 500 samples (minor audio skip but prevents crash!)
+      if (++sampleCount > 500) {
+        delay(1);
+        sampleCount = 0;
+        lastSampleMicros = micros(); // Reset timing after delay
+      } else {
+        unsigned long now = micros();
+        while (now - lastSampleMicros < sampleIntervalMicros) {
+          now = micros();
+        }
+        lastSampleMicros = now;
       }
-      lastSampleMicros += sampleIntervalMicros;
+      
       int32_t val = (sample[0] + 32768) >> 8;
       if (val < 0) val = 0;
       if (val > 255) val = 255;
-      analogWrite(pin, (uint8_t)val);
+      ledcWrite(audioPin, (uint32_t)val);
       return true;
     }
     virtual bool SetRate(int hz) override {
@@ -55,9 +66,13 @@ class AudioOutputPWM : public AudioOutput {
       sampleIntervalMicros = 1000000 / hz;
       return true;
     }
-    virtual bool SetBitsPerSample(int bits) override { return true; }
-    virtual bool SetChannels(int channels) override { return true; }
-    virtual bool stop() override { return true; }
+    virtual bool stop() override {
+      ledcWrite(audioPin, 0); // Duty cycle 0 (OFF) prevents carrier beep safely
+      return true;
+    }
+    virtual ~AudioOutputPWM() {
+      stop();
+    }
 };
 
 EspUsbHost usb;
@@ -385,24 +400,75 @@ void aiTask(void* p) {
     state = SPEAKING; // Use SPEAKING state to block new commands or show UI
     Serial.println("Playing Audio: " + aiAudioUrl);
     
-    AudioFileSourceHTTPStream *file = new AudioFileSourceHTTPStream(aiAudioUrl.c_str());
-    AudioGeneratorMP3 *mp3 = new AudioGeneratorMP3();
-    AudioOutputPWM *out = new AudioOutputPWM(17); // GPIO 17 connected to D8550 Base
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     
-    if (mp3->begin(file, out)) {
-      while(mp3->isRunning()) {
-        if (!mp3->loop()) {
-          mp3->stop();
-        }
-        updateLight(); // Keep the LEDs animating while speaking!
-      }
+    WiFiClient *client = NULL;
+    if (aiAudioUrl.startsWith("https")) {
+      WiFiClientSecure *secureClient = new WiFiClientSecure();
+      secureClient->setInsecure();
+      client = secureClient;
     } else {
-      Serial.println("MP3 Decode failed.");
+      client = new WiFiClient();
     }
     
-    delete mp3;
-    delete file;
-    delete out;
+    http.begin(*client, aiAudioUrl);
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+      int len = http.getSize();
+      bool chunked = (len <= 0);
+      int maxLen = chunked ? 65536 : len; // Allocate 64KB max if size is unknown
+      
+      Serial.print("MP3 Size: "); Serial.println(len);
+      uint8_t * mp3Buff = (uint8_t *) malloc(maxLen);
+      if (mp3Buff) {
+        WiFiClient * stream = http.getStreamPtr();
+        
+        int c = 0;
+        while(stream->connected() && (chunked || c < len)) {
+          size_t available = stream->available();
+          if(available) {
+            int toRead = available;
+            if (c + toRead > maxLen) toRead = maxLen - c;
+            if (toRead > 0) {
+              int bytesRead = stream->readBytes(mp3Buff + c, toRead);
+              c += bytesRead;
+            }
+          }
+          if (c >= maxLen) break;
+          
+          if (!stream->available()) delay(1);
+        }
+        Serial.print("Downloaded MP3 Bytes: "); Serial.println(c);
+        
+        AudioFileSourcePROGMEM *file = new AudioFileSourcePROGMEM(mp3Buff, c);
+        AudioGeneratorMP3 *mp3 = new AudioGeneratorMP3();
+        AudioOutputPWM *out = new AudioOutputPWM(16); // Switched to GPIO 16 to rule out dead pin
+        
+        if (mp3->begin(file, out)) {
+          while(mp3->isRunning()) {
+            if (!mp3->loop()) {
+              mp3->stop();
+            }
+            // updateLight(); // DISABLED FOR TESTING: Keep the LEDs animating while speaking!
+          }
+        } else {
+          Serial.println("MP3 Decode failed.");
+        }
+        
+        delete mp3;
+        delete file;
+        delete out;
+        free(mp3Buff);
+      } else {
+        Serial.println("Out of memory for MP3!");
+      }
+    } else {
+      Serial.print("HTTP Error downloading MP3: "); Serial.println(httpCode);
+    }
+    http.end();
+    delete client;
+    
     state = IDLE;
   }
   
@@ -530,6 +596,16 @@ mic.onclick=()=>{if(recognition)recognition.stop();else voice()};
 
 void setup() {
   Serial.begin(115200);
+
+  // --- SPEAKER HARDWARE TEST BEEP ---
+  pinMode(16, OUTPUT);
+  for (int i=0; i<500; i++) {
+    digitalWrite(16, HIGH);
+    delayMicroseconds(1000);
+    digitalWrite(16, LOW);
+    delayMicroseconds(1000);
+  }
+  
   Serial.println("\n\n--- ESP32 BOOTING ---");
   
   pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
@@ -593,7 +669,11 @@ void setup() {
 
 void loop() {
   server.handleClient();
-  updateLight();
+
+  if (state == IDLE) {
+    // updateLight(); // DISABLED FOR TESTING
+    // updateScreen(); // DISABLED FOR TESTING
+  }
 
   if (resultReady) {
     resultReady = false;
