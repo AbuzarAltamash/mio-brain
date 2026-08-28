@@ -96,6 +96,7 @@ const char* aiServerUrl = "https://mio-brain.onrender.com/ask";
 #define RGB_PIN 48
 #define RGB_COUNT 1
 
+// Hardware SPI constructor
 Adafruit_ST7735 tft(&SPI, TFT_CS, TFT_DC, TFT_RST);
 Adafruit_NeoPixel rgb(RGB_COUNT, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -310,10 +311,12 @@ void updateLight() {
 // --- TOOLS ---
 // --- AI TASK ---
 String callCloudBrain(String text) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
+  Serial.print("Asking Cloud: "); Serial.println(text);
   
+  WiFiClientSecure client;
+  client.setInsecure(); // Bypass CA verification
+  
+  HTTPClient http;
   http.begin(client, aiServerUrl);
   http.setTimeout(45000); // Wait up to 45 seconds for Cloud AI response
   http.addHeader("Content-Type", "application/json");
@@ -450,7 +453,7 @@ void aiTask(void* p) {
             if (!mp3->loop()) {
               mp3->stop();
             }
-            // updateLight(); // DISABLED FOR TESTING: Keep the LEDs animating while speaking!
+            updateLight(); // Keep the LEDs animating while speaking!
           }
         } else {
           Serial.println("MP3 Decode failed.");
@@ -606,18 +609,45 @@ void setup() {
     delayMicroseconds(1000);
   }
   
+  // --- HARDWARE TRIGGER TEST PIN ---
+  pinMode(4, INPUT_PULLUP);
+  Serial.println("GPIO 4 initialized as trigger pin (connect to GND to test).");
+  
   Serial.println("\n\n--- ESP32 BOOTING ---");
   
-  pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL, HIGH);
+  // --- MANUAL HARDWARE RESET (before anything touches the display) ---
+  pinMode(TFT_RST, OUTPUT);
+  digitalWrite(TFT_RST, HIGH);
+  delay(50);
+  digitalWrite(TFT_RST, LOW);
+  delay(50);
+  digitalWrite(TFT_RST, HIGH);
+  delay(150);  // ST7735 datasheet: 120ms after reset before commands
+  Serial.println("TFT hardware reset done");
+  
+  // Backlight ON (static HIGH — no PWM to avoid crosstalk with nearby SPI CLK)
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
   Serial.println("Backlight ON");
   
-  SPI.begin(TFT_CLK, -1, TFT_MOSI, TFT_CS);
-  Serial.println("SPI Started");
+  // Hardware SPI initialization (SS = -1 so Adafruit library handles CS properly)
+  SPI.begin(TFT_CLK, -1, TFT_MOSI, -1);
+  delay(50); // Small delay to let SPI bus stabilize
+
+  Serial.println("Initializing TFT (Hardware SPI, GREENTAB 128x128)...");
+  tft.initR(INITR_144GREENTAB);
+  tft.setRotation(0);
+  Serial.println("TFT initR() complete");
   
-  tft.initR(INITR_144GREENTAB); 
-  tft.setRotation(0); 
+  // --- COLOR TEST PATTERN (verify display is actually working) ---
+  tft.fillScreen(ST77XX_RED);
+  delay(500);
+  tft.fillScreen(ST77XX_GREEN);
+  delay(500);
+  tft.fillScreen(ST77XX_BLUE);
+  delay(500);
   tft.fillScreen(ST77XX_BLACK);
-  Serial.println("TFT Initialized");
+  Serial.println("TFT color test complete — did you see RED, GREEN, BLUE?");
   rgb.begin(); rgb.show(); setLight(0, 0, 0, "off", 120, 0);
 
   tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setCursor(5, 5);
@@ -671,9 +701,39 @@ void loop() {
   server.handleClient();
 
   if (state == IDLE) {
-    // updateLight(); // DISABLED FOR TESTING
-    // updateScreen(); // DISABLED FOR TESTING
+    updateLight();
+    updateTFT();
   }
+
+  // --- HARDWARE TRIGGER TEST ---
+  static bool lastPinState = HIGH;
+  bool currentPinState = digitalRead(4);
+  
+  if (lastPinState == HIGH && currentPinState == LOW) { // Pin connected to GND!
+    Serial.println("GPIO 4 TRIGGERED! Sending notification...");
+    
+    // Quick visual & audio feedback
+    tft.fillScreen(ST77XX_MAGENTA);
+    tft.setCursor(10, 60); tft.setTextSize(2); tft.print("TRIGGER!");
+    digitalWrite(16, HIGH); delay(50); digitalWrite(16, LOW);
+    
+    // Call the Cloud Brain /trigger endpoint
+    String triggerUrl = String(aiServerUrl);
+    triggerUrl.replace("/ask", "/trigger");
+    
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.begin(client, triggerUrl);
+    int code = http.GET();
+    Serial.printf("Cloud Trigger Response: %d\n", code);
+    http.end();
+    
+    delay(500); // Debounce delay
+    tft.fillScreen(ST77XX_BLACK);
+  }
+  lastPinState = currentPinState;
+  // -----------------------------
 
   if (resultReady) {
     resultReady = false;
