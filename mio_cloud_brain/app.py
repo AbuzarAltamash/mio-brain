@@ -204,15 +204,19 @@ def trigger():
     # The user can subscribe to this topic on their phone/browser
     topic = "mio_brain_alerts_8899"
     try:
-        requests.post(f"https://ntfy.sh/{topic}",
+        res = requests.post(f"https://ntfy.sh/{topic}",
             data="Alert! The GPIO pins were connected on MIO.".encode(encoding='utf-8'),
             headers={
                 "Title": "MIO Hardware Alert",
                 "Priority": "urgent",
                 "Tags": "warning,robot"
             })
-        print("Notification sent to ntfy.sh!")
-        return jsonify({"success": True, "message": "Notification sent!"})
+        print(f"ntfy.sh response: {res.status_code} - {res.text}")
+        
+        if res.status_code == 200:
+            return jsonify({"success": True, "message": "Notification sent!"})
+        else:
+            return jsonify({"success": False, "error": f"ntfy error {res.status_code}: {res.text}"})
     except Exception as e:
         print("Error sending notification:", e)
         return jsonify({"success": False, "error": str(e)})
