@@ -198,6 +198,25 @@ def ask():
     print("MIO:", text, "=>", out)
     return jsonify(out)
 
+@app.route("/trigger", methods=["GET", "POST"])
+def trigger():
+    # Send a free push notification via ntfy.sh
+    # The user can subscribe to this topic on their phone/browser
+    topic = "mio_brain_alerts_8899"
+    try:
+        requests.post(f"https://ntfy.sh/{topic}",
+            data="Alert! The GPIO pins were connected on MIO.".encode(encoding='utf-8'),
+            headers={
+                "Title": "MIO Hardware Alert",
+                "Priority": "urgent",
+                "Tags": "warning,robot"
+            })
+        print("Notification sent to ntfy.sh!")
+        return jsonify({"success": True, "message": "Notification sent!"})
+    except Exception as e:
+        print("Error sending notification:", e)
+        return jsonify({"success": False, "error": str(e)})
+
 # Render expects the application object to be named 'app'
 if __name__ == "__main__":
     print("MIO CLOUD BRAIN ONLINE")
