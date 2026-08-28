@@ -7,7 +7,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
 #include <SPI.h>
-#include <Adafruit_NeoPixel.h>
+#include <SPI.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -98,7 +98,10 @@ const char* aiServerUrl = "https://mio-brain.onrender.com/ask";
 
 // Hardware SPI constructor
 Adafruit_ST7735 tft(&SPI, TFT_CS, TFT_DC, TFT_RST);
-Adafruit_NeoPixel rgb(RGB_COUNT, RGB_PIN, NEO_GRB + NEO_KHZ800);
+
+// --- ALARM GLOBALS ---
+#define ALARM_LED_PIN 17
+volatile bool alarmActive = false;
 
 WebServer server(80);
 
@@ -106,7 +109,7 @@ enum State { IDLE, LISTENING, THINKING, SPEAKING, ERROR_STATE };
 volatile State state = IDLE;
 volatile bool aiBusy = false, resultReady = false, aiSuccess = false;
 
-String pendingCommand = "", aiReply = "", aiAction = "none", aiMode = "solid", aiScreen = "none";
+String pendingCommand = "", aiReply = "", aiAction = "none", aiMode = "solid", aiScreen = "none", aiSound = "none";
 int aiR = 0, aiG = 0, aiB = 0;
 int aiSpeed = 120;
 int aiBrightness = 255;
@@ -119,9 +122,21 @@ int lightSpeed = 120;
 unsigned long lightTick = 0;
 bool blinkOn = true;
 int breatheValue = 0, breatheDir = 1;
-String screenMode = "none";
+String screenMode = "face_idle";
 unsigned long screenTick = 0;
 int dogFrame = 0;
+
+// --- PROCEDURAL EYES GLOBALS ---
+struct EyeParams {
+  float x, y, w, h, r; 
+};
+EyeParams curL, tarL;
+EyeParams curR, tarR;
+unsigned long nextBlink = 0;
+bool isBlinking = false;
+unsigned long saccadeTime = 0;
+int eyeOffsetX = 0, eyeOffsetY = 0;
+GFXcanvas16 eyeCanvas(128, 64); // Double buffer for tear-free eyes
 String resultReply = "";
 bool resultSuccess = false;
 uint32_t resultVersion = 0;
@@ -215,60 +230,93 @@ void drawDog(bool init) {
   tft.fillRect(x + 14, leg1, 5, 20, c);
   tft.fillRect(x + 28, leg2, 5, 20, c);
 }
-void drawFace(String mood, bool init) {
-  if (!init) return; // Static faces don't need redrawing unless state changes!
-  tft.fillScreen(ST77XX_BLACK);
-  // header("EMO // FACE", ST77XX_MAGENTA);
-  int leftEyeX = 34, rightEyeX = 94, eyeY = 64;
-  if (mood == "face_idle") {
-    tft.fillRect(leftEyeX - 10, eyeY - 12, 20, 24, ST77XX_CYAN);
-    tft.fillRect(rightEyeX - 10, eyeY - 12, 20, 24, ST77XX_CYAN);
-  } else if (mood == "face_happy") {
-    tft.fillCircle(leftEyeX, eyeY, 12, ST77XX_GREEN);
-    tft.fillCircle(rightEyeX, eyeY, 12, ST77XX_GREEN);
-    tft.fillRect(leftEyeX-12, eyeY, 24, 13, ST77XX_BLACK);
-    tft.fillRect(rightEyeX-12, eyeY, 24, 13, ST77XX_BLACK);
-  } else if (mood == "face_sad") {
-    tft.fillCircle(leftEyeX, eyeY, 12, ST77XX_BLUE);
-    tft.fillCircle(rightEyeX, eyeY, 12, ST77XX_BLUE);
-    tft.fillRect(leftEyeX-12, eyeY-12, 24, 13, ST77XX_BLACK);
-    tft.fillRect(rightEyeX-12, eyeY-12, 24, 13, ST77XX_BLACK);
-  } else if (mood == "face_angry") {
-    tft.fillScreen(ST77XX_RED);
-    tft.fillTriangle(leftEyeX-10, eyeY-5, leftEyeX+10, eyeY+5, leftEyeX-10, eyeY+15, ST77XX_WHITE);
-    tft.fillTriangle(rightEyeX+10, eyeY-5, rightEyeX-10, eyeY+5, rightEyeX+10, eyeY+15, ST77XX_WHITE);
+void updateEyes(bool forceClear) {
+  unsigned long now = millis();
+  
+  if (forceClear) {
+    tft.fillScreen(ST77XX_BLACK);
+    curL = {34, 64, 26, 40, 8};
+    curR = {94, 64, 26, 40, 8};
   }
+
+  // 1. Behavior Logic (Blinking & Saccades)
+  if (now > nextBlink) {
+    isBlinking = !isBlinking;
+    if (isBlinking) nextBlink = now + 150; // Blink duration
+    else nextBlink = now + random(2000, 5000); // Time between blinks
+  }
+  
+  if (now > saccadeTime) {
+    if (random(10) > 3) {
+      eyeOffsetX = random(-12, 12);
+      eyeOffsetY = random(-10, 10);
+    } else {
+      eyeOffsetX = 0; eyeOffsetY = 0; // Look forward
+    }
+    saccadeTime = now + random(500, 2500);
+  }
+
+  // 2. Base Shapes for Mood
+  int bw = 26, bh = 40, br = 8;
+  uint16_t color = ST77XX_CYAN;
+  int baseLY = 64, baseRY = 64;
+  
+  if (screenMode == "face_happy") { bw=30; bh=14; br=6; color=ST77XX_GREEN; }
+  else if (screenMode == "face_sad") { bw=34; bh=20; br=6; color=ST77XX_BLUE; baseLY=72; baseRY=72; }
+  else if (screenMode == "face_angry") { bw=26; bh=30; br=4; color=ST77XX_RED; }
+  else if (screenMode == "face_surprised") { bw=22; bh=46; br=10; color=ST77XX_YELLOW; baseLY=54; baseRY=54; } // Tall, high up
+  else if (screenMode == "face_suspicious") { bw=30; bh=10; br=2; color=ST77XX_MAGENTA; } // Narrow slits
+  else if (screenMode == "face_sleepy") { bw=34; bh=12; br=4; color=ST77XX_CYAN; baseLY=76; baseRY=76; } // Low, flat
+
+  // 3. Set Targets
+  tarL.w = bw; tarL.h = isBlinking ? 4 : bh; tarL.r = br;
+  tarL.x = 34 + eyeOffsetX; tarL.y = baseLY + eyeOffsetY;
+  
+  tarR.w = bw; tarR.h = isBlinking ? 4 : bh; tarR.r = br;
+  tarR.x = 94 + eyeOffsetX; tarR.y = baseRY + eyeOffsetY;
+
+  // 4. Easing Physics (Morphing)
+  float ease = 0.4;
+  curL.w += (tarL.w - curL.w) * ease; curL.h += (tarL.h - curL.h) * ease;
+  curL.r += (tarL.r - curL.r) * ease; curL.x += (tarL.x - curL.x) * ease; curL.y += (tarL.y - curL.y) * ease;
+  
+  curR.w += (tarR.w - curR.w) * ease; curR.h += (tarR.h - curR.h) * ease;
+  curR.r += (tarR.r - curR.r) * ease; curR.x += (tarR.x - curR.x) * ease; curR.y += (tarR.y - curR.y) * ease;
+
+  // 5. Draw Engine using Double Buffering (Canvas) to eliminate ALL tearing!
+  eyeCanvas.fillScreen(0x0000); // Black background
+
+  int canvasOffsetY = 32; // The canvas draws from Y=32 to Y=96 on the real screen
+  
+  int nLx = curL.x - curL.w/2; int nLy = (curL.y - curL.h/2) - canvasOffsetY;
+  int nRx = curR.x - curR.w/2; int nRy = (curR.y - curR.h/2) - canvasOffsetY;
+  
+  // Draw new rounded rects to memory buffer
+  eyeCanvas.fillRoundRect(nLx, nLy, curL.w, curL.h, curL.r, color);
+  eyeCanvas.fillRoundRect(nRx, nRy, curR.w, curR.h, curR.r, color);
+  
+  // Add angry expression mask (diagonal cuts)
+  if (screenMode == "face_angry") {
+     eyeCanvas.fillTriangle(nLx-1, nLy-1, nLx+14, nLy-1, nLx-1, nLy+14, 0x0000);
+     eyeCanvas.fillTriangle(nRx+curR.w+1, nRy-1, nRx+curR.w-14, nRy-1, nRx+curR.w+1, nRy+14, 0x0000);
+  }
+  
+  // Blast memory buffer to screen instantly
+  tft.drawRGBBitmap(0, canvasOffsetY, eyeCanvas.getBuffer(), 128, 64);
 }
 void updateTFT() {
   unsigned long now = millis();
-  
-  bool screenChanged = (screenMode != prevScreenMode);
-  prevScreenMode = screenMode;
-  
   bool stateChanged = (state != prevState);
   prevState = state;
-  
-  if (screenMode == "dog_running") {
-    if (now - screenTick > 140) {
-      screenTick = now; dogFrame++; drawDog(screenChanged);
-    }
-    return;
-  }
-  if (screenMode.startsWith("face_")) {
-    if (screenChanged) {
-      drawFace(screenMode, true);
-    }
-    return;
-  }
-  
-  if (now - animTick < 70) return;
-  animTick = now; frame++;
-  
-  if (state == IDLE) drawIdle(stateChanged || screenChanged);
-  else if (state == LISTENING) drawListening(stateChanged || screenChanged);
-  else if (state == THINKING) drawThinking(stateChanged || screenChanged);
-  else if (state == ERROR_STATE) {
-    if (stateChanged || screenChanged) {
+
+  // 1. System States ALWAYS override the face (Listening, Thinking, Error)
+  if (state == LISTENING || state == THINKING || state == ERROR_STATE) {
+    if (now - animTick < 70) return;
+    animTick = now; frame++;
+    
+    if (state == LISTENING) drawListening(stateChanged);
+    else if (state == THINKING) drawThinking(stateChanged);
+    else if (state == ERROR_STATE && stateChanged) {
       tft.fillScreen(ST77XX_BLACK);
       header("EMO // ERROR", ST77XX_RED);
       tft.setTextColor(ST77XX_RED);
@@ -276,12 +324,40 @@ void updateTFT() {
       tft.setCursor(25, 55);
       tft.print("ERROR");
     }
+    
+    // Force a full redraw of the face when we eventually return to IDLE
+    prevScreenMode = "overridden";
+    return;
   }
+
+  // 2. IDLE State - Draw the requested screenMode
+  bool screenChanged = (screenMode != prevScreenMode);
+  prevScreenMode = screenMode;
+  
+  if (screenMode == "dog_running") {
+    if (now - screenTick > 140) {
+      screenTick = now; dogFrame++; drawDog(screenChanged);
+    }
+    return;
+  }
+  
+  if (screenMode.startsWith("face_")) {
+    updateEyes(screenChanged);
+    return;
+  }
+  
+  // Fallback to original idle orb if screenMode is literally "none"
+  if (now - animTick < 70) return;
+  animTick = now; frame++;
+  drawIdle(screenChanged);
 }
 
 void applyPixel(int r, int g, int b, int brightness) {
   r = constrain(r, 0, 255); g = constrain(g, 0, 255); b = constrain(b, 0, 255); brightness = constrain(brightness, 0, 255);
-  rgb.setBrightness(brightness); rgb.setPixelColor(0, rgb.Color(r, g, b)); rgb.show();
+  int finalR = (r * brightness) / 255;
+  int finalG = (g * brightness) / 255;
+  int finalB = (b * brightness) / 255;
+  neopixelWrite(RGB_PIN, finalR, finalG, finalB);
 }
 void setLight(int r, int g, int b, String mode, int speed, int brightness) {
   lightR = constrain(r, 0, 255); lightG = constrain(g, 0, 255); lightB = constrain(b, 0, 255); lightBrightness = constrain(brightness, 0, 255);
@@ -359,6 +435,7 @@ void aiTask(void* p) {
         aiAction = aiDoc["action"] | "none";
         aiMode = aiDoc["mode"] | "solid";
         aiScreen = aiDoc["screen"] | "none";
+        aiSound = aiDoc["sound"] | "none";
         aiR = aiDoc["r"] | 0; aiG = aiDoc["g"] | 0; aiB = aiDoc["b"] | 0;
         aiSpeed = aiDoc["speed_ms"] | 120;
         aiBrightness = aiDoc["brightness"] | 255;
@@ -401,6 +478,27 @@ void aiTask(void* p) {
   // --- PLAY AUDIO IF AVAILABLE ---
   if (aiAudioUrl != "") {
     state = SPEAKING; // Use SPEAKING state to block new commands or show UI
+    
+    // Play Sound Effect immediately before downloading speech!
+    if (aiSound != "none" && aiSound != "") {
+      pinMode(16, OUTPUT);
+      if (aiSound == "beep") {
+        for(int i=0; i<100; i++) { digitalWrite(16, HIGH); delayMicroseconds(400); digitalWrite(16, LOW); delayMicroseconds(400); }
+      } else if (aiSound == "success") {
+        for(int i=0; i<80; i++) { digitalWrite(16, HIGH); delayMicroseconds(600); digitalWrite(16, LOW); delayMicroseconds(600); }
+        delay(40);
+        for(int i=0; i<120; i++) { digitalWrite(16, HIGH); delayMicroseconds(350); digitalWrite(16, LOW); delayMicroseconds(350); }
+      } else if (aiSound == "error") {
+        for(int i=0; i<150; i++) { digitalWrite(16, HIGH); delayMicroseconds(1800); digitalWrite(16, LOW); delayMicroseconds(1800); }
+      } else if (aiSound == "alarm") {
+        for(int j=0; j<3; j++) {
+          for(int i=0; i<80; i++) { digitalWrite(16, HIGH); delayMicroseconds(400); digitalWrite(16, LOW); delayMicroseconds(400); }
+          delay(50);
+        }
+      }
+      delay(100); // Small pause before speaking
+    }
+    
     Serial.println("Playing Audio: " + aiAudioUrl);
     
     HTTPClient http;
@@ -482,6 +580,28 @@ void startJob(String text) {
   if (aiBusy) return;
   pendingCommand = text; aiBusy = true; resultReady = false; state = THINKING;
   xTaskCreatePinnedToCore(aiTask, "EMOAI", 12000, NULL, 1, NULL, 0); // Need more stack for JSON
+}
+
+// --- RADAR ALARM TASK ---
+void radarAlarmTask(void* p) {
+  while (alarmActive) {
+    digitalWrite(ALARM_LED_PIN, HIGH);
+    
+    // Force pin 16 back to standard digital OUTPUT (overriding the MP3 Audio PWM if it took control)
+    pinMode(16, OUTPUT); 
+    
+    // Loud 1kHz Alarm Chirp for 100ms
+    for(int i=0; i<100; i++) {
+        digitalWrite(16, HIGH); delayMicroseconds(500);
+        digitalWrite(16, LOW);  delayMicroseconds(500);
+    }
+    
+    digitalWrite(ALARM_LED_PIN, LOW);
+    vTaskDelay(100 / portTICK_PERIOD_MS); 
+  }
+  
+  digitalWrite(ALARM_LED_PIN, LOW);
+  vTaskDelete(NULL);
 }
 
 // --- HTTP SERVER HANDLERS ---
@@ -637,7 +757,12 @@ void setup() {
   Serial.println("Initializing TFT (Hardware SPI, GREENTAB 128x128)...");
   tft.initR(INITR_144GREENTAB);
   tft.setRotation(0);
-  Serial.println("TFT initR() complete");
+  
+  // --- OVERRIDE SPI SPEED FOR HIGH FPS ---
+  // Default is 24MHz-32MHz. Pushing to 60MHz dramatically reduces "waves" (screen tearing)
+  tft.setSPISpeed(60000000); 
+  
+  Serial.println("TFT initR() complete at 60MHz");
   
   // --- COLOR TEST PATTERN (verify display is actually working) ---
   tft.fillScreen(ST77XX_RED);
@@ -648,10 +773,14 @@ void setup() {
   delay(500);
   tft.fillScreen(ST77XX_BLACK);
   Serial.println("TFT color test complete — did you see RED, GREEN, BLUE?");
-  rgb.begin(); rgb.show(); setLight(0, 0, 0, "off", 120, 0);
+  setLight(0, 0, 0, "off", 120, 0);
 
   tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setCursor(5, 5);
   tft.println("Init...");
+  
+  // Initialize Alarm LED (Strobe)
+  pinMode(ALARM_LED_PIN, OUTPUT);
+  digitalWrite(ALARM_LED_PIN, LOW); // Ensure LED is off
   
   // Start USB Host in the background
   // usb.begin();
@@ -710,33 +839,39 @@ void loop() {
   bool currentPinState = digitalRead(4);
   
   if (lastPinState == HIGH && currentPinState == LOW) { // Pin connected to GND!
-    Serial.println("GPIO 4 TRIGGERED! Sending notification...");
+    Serial.println("GPIO 4 TRIGGERED! Starting radar alarm...");
     
-    // Quick visual & audio feedback
+    // Quick visual feedback
     tft.fillScreen(ST77XX_MAGENTA);
     tft.setCursor(10, 60); tft.setTextSize(2); tft.print("TRIGGER!");
     
-    // Proper beep (approx 500Hz for 100ms)
-    for(int i=0; i<50; i++) {
-        digitalWrite(16, HIGH); delayMicroseconds(1000);
-        digitalWrite(16, LOW);  delayMicroseconds(1000);
-    }
+    // 1. START BACKGROUND ALARM TASK
+    alarmActive = true;
+    xTaskCreatePinnedToCore(radarAlarmTask, "RadarAlarm", 2048, NULL, 1, NULL, 0);
     
-    // Call the Cloud Brain /trigger endpoint
-    String triggerUrl = String(aiServerUrl);
-    triggerUrl.replace("/ask", "/trigger");
-    
+    // 2. Send notification directly from ESP32 on main core
     WiFiClientSecure client;
     client.setInsecure();
     HTTPClient http;
-    http.begin(client, triggerUrl);
-    int code = http.GET();
+    http.begin(client, "https://ntfy.sh/mio_brain_alerts_8899");
+    
+    // Add ntfy.sh headers
+    http.addHeader("Title", "MIO Hardware Alert");
+    http.addHeader("Priority", "urgent");
+    http.addHeader("Tags", "warning,robot");
+    http.addHeader("Authorization", "Bearer tk_8k3fybdtv0i9dvkpml102h3ovmwx2");
+    
+    // Post the message (This blocks for 1-2 seconds while negotiating TLS)
+    int code = http.POST("Alert! The GPIO pins were connected on MIO.");
+    
+    // 3. NOTIFICATION SENT! STOP ALARM TASK
+    alarmActive = false;
     
     // Show the HTTP result on screen to debug!
     tft.fillScreen(ST77XX_BLUE);
     tft.setCursor(10, 60);
-    tft.print("HTTP: "); tft.print(code);
-    Serial.printf("Cloud Trigger Response: %d\n", code);
+    tft.print("NTFY: "); tft.print(code);
+    Serial.printf("ntfy.sh Direct Response: %d\n", code);
     
     http.end();
     delay(2000); // Give user time to read the HTTP code

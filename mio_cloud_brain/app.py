@@ -26,7 +26,8 @@ Return ONLY one valid JSON object with exactly these keys:
  "mode":"solid or blink or breathe or off",
  "speed_ms":120,
  "brightness":255,
- "screen":"none or dog_running or clear or face_idle or face_happy or face_sad or face_angry",
+ "screen":"none or dog_running or clear or face_idle or face_happy or face_sad or face_angry or face_surprised or face_suspicious or face_sleepy",
+ "sound":"none or beep or success or error or alarm",
  "tool":"none or weather or joke",
  "tool_args":""
 }
@@ -43,9 +44,15 @@ LIGHT INTERPRETATION:
 - "turn on" without a color should use a sensible white unless context provides a color.
 
 SCREEN INTERPRETATION:
-- To show a dog running, set screen="dog_running". To clear the screen, set screen="clear".
-- To show expressive robot eyes, set screen to one of: "face_idle", "face_happy", "face_sad", "face_angry". Choose the emotion that fits your reply.
-- A light command and a screen request may occur together.
+- To show expressive robot eyes, set screen to one of: "face_idle", "face_happy", "face_sad", "face_angry", "face_surprised", "face_suspicious", "face_sleepy".
+- Choose the emotion that perfectly matches your reply. Get creative!
+
+SOUND INTERPRETATION:
+- Use "success" for completing a task (like turning on a light).
+- Use "error" if a tool fails or you can't do something.
+- Use "alarm" for serious alerts.
+- Use "beep" for minor acknowledgments.
+- Use "none" for normal conversation without any special sound effects.
 
 TOOL USAGE:
 - If you need to know the current weather, set "tool":"weather" and "tool_args":"City Name". (If no city is given, leave it empty).
@@ -127,7 +134,7 @@ def ask():
     data = request.get_json(silent=True) or {}
     text = str(data.get("text","")).strip()
     if not text:
-        return jsonify(success=False, reply="No command received.", action="none", r=0,g=0,b=0,mode="solid",speed_ms=120,brightness=255,screen="none"),400
+        return jsonify(success=False, reply="No command received.", action="none", r=0,g=0,b=0,mode="solid",speed_ms=120,brightness=255,screen="none", sound="none"),400
     
     # Inject Context
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -141,7 +148,7 @@ def ask():
     ai = ask_ollama(messages)
     
     if not ai:
-        return jsonify(success=False,reply="AI core connection error.",action="none",r=0,g=0,b=0,mode="solid",speed_ms=120,brightness=255,screen="none"),500
+        return jsonify(success=False,reply="AI core connection error.",action="none",r=0,g=0,b=0,mode="solid",speed_ms=120,brightness=255,screen="face_sad", sound="error"),500
 
     tool = ai.get("tool", "none")
     if tool and tool != "none":
@@ -167,7 +174,9 @@ def ask():
     mode = ai.get("mode","solid")
     if mode not in ("solid","blink","breathe","off"): mode="solid"
     screen = ai.get("screen","none")
-    if screen not in ("none","dog_running","clear", "face_idle", "face_happy", "face_sad", "face_angry"): screen="none"
+    if screen not in ("none","dog_running","clear", "face_idle", "face_happy", "face_sad", "face_angry", "face_surprised", "face_suspicious", "face_sleepy"): screen="none"
+    sound = ai.get("sound", "none")
+    if sound not in ("none", "beep", "success", "error", "alarm"): sound="none"
     
     
     # Generate TTS Audio
@@ -193,6 +202,7 @@ def ask():
         "speed_ms": clamp(ai.get("speed_ms",120),30,2000,120),
         "brightness": clamp(ai.get("brightness",255),0,255,255),
         "screen": screen,
+        "sound": sound,
         "audio_url": audio_url
     }
     print("MIO:", text, "=>", out)
