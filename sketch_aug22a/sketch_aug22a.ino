@@ -715,7 +715,12 @@ void loop() {
     // Quick visual & audio feedback
     tft.fillScreen(ST77XX_MAGENTA);
     tft.setCursor(10, 60); tft.setTextSize(2); tft.print("TRIGGER!");
-    digitalWrite(16, HIGH); delay(50); digitalWrite(16, LOW);
+    
+    // Proper beep (approx 500Hz for 100ms)
+    for(int i=0; i<50; i++) {
+        digitalWrite(16, HIGH); delayMicroseconds(1000);
+        digitalWrite(16, LOW);  delayMicroseconds(1000);
+    }
     
     // Call the Cloud Brain /trigger endpoint
     String triggerUrl = String(aiServerUrl);
@@ -726,10 +731,15 @@ void loop() {
     HTTPClient http;
     http.begin(client, triggerUrl);
     int code = http.GET();
-    Serial.printf("Cloud Trigger Response: %d\n", code);
-    http.end();
     
-    delay(500); // Debounce delay
+    // Show the HTTP result on screen to debug!
+    tft.fillScreen(ST77XX_BLUE);
+    tft.setCursor(10, 60);
+    tft.print("HTTP: "); tft.print(code);
+    Serial.printf("Cloud Trigger Response: %d\n", code);
+    
+    http.end();
+    delay(2000); // Give user time to read the HTTP code
     tft.fillScreen(ST77XX_BLACK);
   }
   lastPinState = currentPinState;
