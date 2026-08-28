@@ -209,7 +209,8 @@ def trigger():
             headers={
                 "Title": "MIO Hardware Alert",
                 "Priority": "urgent",
-                "Tags": "warning,robot"
+                "Tags": "warning,robot",
+                "Authorization": "Bearer tk_8k3fybdtv0i9dvkpml102h3ovmwx2"
             })
         print(f"ntfy.sh response: {res.status_code} - {res.text}")
         
